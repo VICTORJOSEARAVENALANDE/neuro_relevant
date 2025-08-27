@@ -1,0 +1,346 @@
+/**
+ * Nettskjema → Google Sheets Importer
+ * ------------------------------------------------------------
+ * WHAT IT DOES
+ * - Reads Nettskjema registration emails in Gmail (with label GMAIL_QUERY).
+ * - Appends rows to the “Registrations” sheet with:
+ *   Date registered, Name, Birth date, Sex, Handedness, E-mail, Phone number, NorwegianID, Include, comments.
+ * - Adds a second sheet -> De-dupes via a Processed sheet (message IDs) and only processes the first message per thread.
+ * - Gated to actual Nettskjema submissions (must contain a nettskjema.no/user/form URL).
+ *
+ * ONE–TIME SETUP (do once)
+ * 1) In Gmail, ensure label matches GMAIL_QUERY (e.g., Nettskjema_Registration).
+ * 2) In the Apps Script editor, Run → processEmails (authorize if prompted).
+ * 3) Run → ensureHourlyTrigger (installs the hourly trigger).
+ * 4) In the sheet, verify headers in row 1 match exactly (the script enforces them).
+ *
+ * DAILY USE
+ * - New labeled emails are appended hourly. You can also run Nettskjema → Process emails now.
+ *
+ * RE-INGEST / DEBUG
+ * - Re-import specific messages: delete their IDs (rows 2+) from the “Processed” sheet, then run processEmails.
+ * - Change schedule: open Triggers and adjust; or re-run ensureHourlyTrigger.
+ * - Nettskjema → Count candidates logs how many threads/messages match your GMAIL_QUERY.
+ *
+ * NOTES
+ * - Time zone: Europe/Oslo (set in TIMEZONE and Project Settings).
+ * - "Birth date" kept as text; “Include” = Yes only if the exact confirmation sentence is present.
+ * - Comments block reads everything under “Any comments or questions?” until the next title/blank line.
+ */
+
+/*** CONFIG ***/
+const SHEET_NAME = 'Registrations';
+const LOG_SHEET_NAME = 'Processed';
+const GMAIL_QUERY = 'label:Nettskjema_Registration after:2025/06/01 -in:spam -in:trash';
+const MAX_THREADS_PER_RUN = 100;
+const TIMEZONE = 'Europe/Oslo';
+const PROCESSED_LABEL = 'Nettskjema_Processed';
+const AFTER_DATE_ISO = '2025-01-01'; // '' to disable
+const ONLY_FIRST_MESSAGE_PER_THREAD = true; // avoid duplicates in threads
+
+/*** MAIN ***/
+function processEmails() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) return;
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = getOrCreateSheet_(ss, SHEET_NAME, [
+      'Date registered','Name','Birth date','Sex','Handedness','E-mail','Phone number',
+      'NorwegianID','Include','comments'
+    ]);
+    const log = getOrCreateSheet_(ss, LOG_SHEET_NAME, ['Message ID']);
+    const processed = new Set(getColValues_(log, 1).filter(Boolean));
+
+    const afterCutoff = AFTER_DATE_ISO ? new Date(AFTER_DATE_ISO + 'T00:00:00') : null;
+    const threads = GmailApp.search(GMAIL_QUERY, 0, MAX_THREADS_PER_RUN);
+    if (!threads.length) return;
+
+    const processedLabel = getOrCreateLabel_(PROCESSED_LABEL);
+    const rowsToAppend = [];
+    const idsToLog = [];
+
+    threads.forEach(thread => {
+      const messages = thread.getMessages();
+      const toProcess = ONLY_FIRST_MESSAGE_PER_THREAD ? [messages[0]] : messages;
+      let appendedThisThread = false;
+
+      toProcess.forEach(msg => {
+        const id = msg.getId();
+        if (processed.has(id)) return; // already done
+
+        const body = getBestBody_(msg);
+        if (!/https?:\/\/nettskjema\.no\/user\/form\//i.test(body)) return; // hard gate
+
+        const parsed = parseNettskjema_(body, msg);
+
+        if (afterCutoff) {
+          const d = new Date(parsed.dateRegistered + 'T00:00:00');
+          if (d < afterCutoff) return;
+        }
+
+        rowsToAppend.push([
+          parsed.dateRegistered,
+          parsed.name || '',
+          parsed.birthDate || '',
+          parsed.sex || '',
+          parsed.handedness || '',
+          parsed.email || '',
+          parsed.phone || '',
+          parsed.norwegianIdYN || '',
+          parsed.includeYN || '',
+          parsed.comments || ''
+        ]);
+        idsToLog.push([id]);
+        appendedThisThread = true;
+      });
+
+      if (appendedThisThread && processedLabel) thread.addLabel(processedLabel);
+    });
+
+    if (rowsToAppend.length) {
+      const startRow = sheet.getLastRow() + 1;
+      sheet.getRange(startRow, 1, rowsToAppend.length, 10).setValues(rowsToAppend);
+      const logStart = log.getLastRow() + 1;
+      log.getRange(logStart, 1, idsToLog.length, 1).setValues(idsToLog);
+    }
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/*** UTILITIES ***/
+function getOrCreateSheet_(ss, name, headers) {
+  let sh = ss.getSheetByName(name);
+  if (!sh) sh = ss.insertSheet(name);
+  if (sh.getLastRow() === 0) sh.appendRow(headers);
+  else {
+    const existing = sh.getRange(1,1,1,headers.length).getValues()[0];
+    const mismatch = headers.some((h,i)=> (existing[i]||'').trim() !== h);
+    if (mismatch) sh.getRange(1,1,1,headers.length).setValues([headers]);
+  }
+  return sh;
+}
+function getColValues_(sheet, col) {
+  const last = sheet.getLastRow();
+  if (last < 2) return [];
+  return sheet.getRange(2, col, last - 1, 1).getValues().map(r => r[0]);
+}
+function getOrCreateLabel_(name) {
+  return GmailApp.getUserLabelByName(name) || GmailApp.createLabel(name);
+}
+
+/*** BODY + NORMALIZERS ***/
+function stripQuoted_(text) {
+  const t = String(text).replace(/\r\n?/g, '\n');
+  const lines = t.split('\n');
+  const cut = lines.findIndex(l => /^>/.test(l) || /^(On .+ wrote:|-----Original Message-----)/i.test(l));
+  return (cut >= 0 ? lines.slice(0, cut) : lines).join('\n');
+}
+function getBestBody_(msg) {
+  const plain = (msg.getPlainBody() || '').trim();
+  const base = plain ? plain : (msg.getBody() || '')
+    .replace(/<br\s*\/?>(?=\s*\n?)/gi, '\n')
+    .replace(/<\/(p|div|br)>/gi, '\n')
+    .replace(/<[^>]*>/g, '')
+    .replace(/&nbsp;/g, ' ');
+  return stripQuoted_(base).trim();
+}
+function normLine_(v) {
+  if (!v) return '';
+  let s = String(v)
+    .replace(/\u00A0/g, ' ')
+    .trim()
+    .replace(/^(\*|-|•|–|—|>|\")\s*/, '');
+  if (/^not answered$/i.test(s)) return '';
+  return s.trim();
+}
+function normPhone_(v) {
+  const s = normLine_(v);
+  const plus = s.trim().startsWith('+') ? '+' : '';
+  const digits = s.replace(/[^\d]/g, '');
+  return (plus + digits).trim();
+}
+function toYesNo_(v) {
+  const s = normLine_(v).toLowerCase();
+  if (s.startsWith('yes') || s === 'ja') return 'Yes';
+  if (s.startsWith('no') || s === 'nei') return 'No';
+  return s ? s : '';
+}
+function isTitleLine_(s) {
+  return /^(your name|sex|kjønn|birth\s*date|fødsel.*dato|handedness|hånddominans|dominant\s*hand|what is your e-?mail address\??|e-?mail address|email|epost|what is your phone number\??|phone number|telefon|can you please confirm whether you have a norwegian national id number|any comments or questions\?)/i.test(s);
+}
+
+/*** PARSER — line-scanner with robust Include detection ***/
+function parseNettskjema_(body, msg) {
+  // Date from header or message timestamp
+  let dateStr = '';
+  let nameFromDelivery = '';
+  const delivered = body.match(/delivered by\s+(.+?)\s+on\s+(\d{2}\.\d{2}\.\d{4})/i);
+  if (delivered) {
+    nameFromDelivery = normLine_(delivered[1]);
+    dateStr = delivered[2];
+  }
+  const regDate = dateStr ? ddmmyyyyToDate_(dateStr) : msg.getDate();
+  const dateRegistered = Utilities.formatDate(regDate, TIMEZONE, 'yyyy-MM-dd');
+
+  const cleanBody = stripQuoted_(body).replace(/\r\n?/g, '\n');
+  const lines = cleanBody.split('\n');
+
+  const out = {
+    name: nameFromDelivery || '',
+    birthDate: '', sex: '', handedness: '', email: '', phone: '', norwegianIdYN: '', includeYN: 'No', comments: ''
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const s = normLine_(lines[i]);
+    if (!s) continue;
+
+    // Name question overrides delivery name
+    if (/^(your name( \(first name and surname\))?\??)$/i.test(s)) {
+      const val = nextNonEmptyValue_(lines, i + 1);
+      if (val) out.name = normLine_(val);
+      continue;
+    }
+
+    // Birth date
+    if (/^(birth\s*date|fødsel.*dato)$/i.test(s)) {
+      const val = nextNonEmptyValue_(lines, i + 1);
+      if (val) out.birthDate = normLine_(val);
+      continue;
+    }
+
+    // Sex
+    if (/^(sex|kjønn)$/i.test(s)) {
+      const val = nextNonEmptyValue_(lines, i + 1);
+      if (val) out.sex = normLine_(val);
+      continue;
+    }
+
+    // Handedness
+    if (/^(handedness|hånddominans|dominant\s*hand)$/i.test(s)) {
+      const val = nextNonEmptyValue_(lines, i + 1);
+      if (val) out.handedness = normLine_(val);
+      continue;
+    }
+
+    // Email (question or short label)
+    if (/^(what is your e-?mail address\??)$/i.test(s) || /^(e-?mail address|email|epost)$/i.test(s)) {
+      const val = nextNonEmptyValue_(lines, i + 1);
+      if (val) out.email = normLine_(val);
+      continue;
+    }
+
+    // Phone
+    if (/^(what is your phone number\??|phone number|telefon)$/i.test(s)) {
+      const val = nextNonEmptyValue_(lines, i + 1);
+      if (val) out.phone = normPhone_(val);
+      continue;
+    }
+
+    // Norwegian ID -> scan forward to the first Yes/No (skip explanatory line)
+    if (!out.norwegianIdYN && /^can you please confirm whether you have a norwegian national id number/i.test(s)) {
+      const yn = nextYesNo_(lines, i + 1);
+      if (yn) out.norwegianIdYN = toYesNo_(yn);
+      continue;
+    }
+
+    // Comments block (may be multi-line until blank line or next title)
+    if (/^(any comments or questions\?)$/i.test(s)) {
+      const block = nextBlockText_(lines, i + 1);
+      if (block) out.comments = block;
+      continue;
+    }
+  }
+
+  // Robust Include detection across the whole (cleaned) body
+  if (out.includeYN !== 'Yes') {
+    const flat = cleanBody
+      .replace(/[\u00A0\s]+/g, ' ')        // collapse spaces
+      .replace(/(^|\s)[\*\-•–—](?=\s)/g, ' ') // drop bullet markers
+      .trim();
+    if (/\bi confirm that i meet the inclusion criteria and that the exclusion criteria do not apply to me\b/i.test(flat)) {
+      out.includeYN = 'Yes';
+    }
+  }
+
+  return {
+    dateRegistered,
+    name: out.name,
+    birthDate: out.birthDate,
+    sex: out.sex,
+    handedness: out.handedness,
+    phone: out.phone,
+    email: out.email,
+    norwegianIdYN: out.norwegianIdYN,
+    includeYN: out.includeYN,
+    comments: out.comments
+  };
+}
+
+function nextNonEmptyValue_(lines, startIdx) {
+  for (let j = startIdx; j < lines.length; j++) {
+    const val = normLine_(lines[j]);
+    if (!val) continue;                // skip blanks
+    if (/^not answered$/i.test(val)) return '';
+    if (isTitleLine_(val)) return '';  // don't consume the next title
+    return val;
+  }
+  return '';
+}
+function nextYesNo_(lines, startIdx) {
+  for (let j = startIdx; j < lines.length; j++) {
+    const val = normLine_(lines[j]);
+    if (!val) continue;
+    if (/^(yes|no|ja|nei)\b/i.test(val)) return val;
+    if (isTitleLine_(val)) return '';
+  }
+  return '';
+}
+function nextBlockText_(lines, startIdx) {
+  const out = [];
+  let started = false;
+  for (let j = startIdx; j < lines.length; j++) {
+    const val = normLine_(lines[j]);
+    if (!val) {
+      if (started) break; // end of block
+      else continue;      // skip leading blanks
+    }
+    if (/^not answered$/i.test(val)) return '';
+    if (isTitleLine_(val)) break;
+    out.push(val);
+    started = true;
+  }
+  return out.join(' ');
+}
+
+function ddmmyyyyToDate_(s) {
+  const [dd, mm, yyyy] = String(s).split('.').map(x => parseInt(x,10));
+  return new Date(yyyy || 1970, (mm||1)-1, dd||1);
+}
+
+/*** TRIGGERS + DEBUG ***/
+function ensureHourlyTrigger() {
+  const fn = 'processEmails';
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === fn && t.getEventType() === ScriptApp.EventType.CLOCK)
+    .forEach(ScriptApp.deleteTrigger);
+  ScriptApp.newTrigger(fn).timeBased().everyHours(1).create();
+}
+function resetProcessed() {
+  const log = SpreadsheetApp.getActive().getSheetByName(LOG_SHEET_NAME);
+  if (!log) return;
+  const last = log.getLastRow();
+  if (last > 1) log.deleteRows(2, last - 1);
+}
+function countCandidates() {
+  const threads = GmailApp.search(GMAIL_QUERY, 0, 200);
+  let msgs = 0; threads.forEach(t => msgs += t.getMessageCount());
+  Logger.log(`Threads: ${threads.length}, Messages: ${msgs}`);
+}
+function onOpen() {
+  SpreadsheetApp.getUi().createMenu('Nettskjema')
+    .addItem('Process emails now', 'processEmails')
+    .addItem('Count candidates', 'countCandidates')
+    .addItem('Reset processed log', 'resetProcessed')
+    .addToUi();
+}
